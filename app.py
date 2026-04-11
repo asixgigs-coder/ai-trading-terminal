@@ -2,7 +2,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from xgboost import XGBClassifier
+from sklearn.ensemble import RandomForestClassifier
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator
 from ta.volatility import AverageTrueRange
@@ -63,7 +63,7 @@ def train(df):
     X = df[feats]
     y = df["target"]
     split = int(len(df)*0.8)
-    model = XGBClassifier(n_estimators=100,max_depth=4)
+    model = RandomForestClassifier(n_estimators=100)
     model.fit(X[:split], y[:split])
     return model, feats
 
