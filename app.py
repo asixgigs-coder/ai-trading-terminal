@@ -27,16 +27,29 @@ auto_trade = st.sidebar.toggle("Auto Trade", False)
 
 @st.cache_data(ttl=60)
 def fetch(symbol):
-    df = yf.download(symbol, period=PERIOD, interval=INTERVAL)
+    df = yf.download(symbol, period=PERIOD, interval=INTERVAL, auto_adjust=True)
+
+    # 🔥 FIX: flatten columns if MultiIndex
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    df = df[["Open", "High", "Low", "Close", "Volume"]]
+
     df.dropna(inplace=True)
     return df
 
 def features(df):
-    df["ema20"] = EMAIndicator(df["Close"], 20).ema_indicator()
-    df["ema50"] = EMAIndicator(df["Close"], 50).ema_indicator()
-    df["rsi"] = RSIIndicator(df["Close"], 14).rsi()
-    df["atr"] = AverageTrueRange(df["High"], df["Low"], df["Close"], 14).average_true_range()
-    df["returns"] = df["Close"].pct_change()
+    close = df["Close"].astype(float)
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+
+    df["ema20"] = EMAIndicator(close, window=20).ema_indicator()
+    df["ema50"] = EMAIndicator(close, window=50).ema_indicator()
+    df["rsi"] = RSIIndicator(close, window=14).rsi()
+    df["atr"] = AverageTrueRange(high, low, close, window=14).average_true_range()
+
+    df["returns"] = close.pct_change()
+
     df.dropna(inplace=True)
     return df
 
