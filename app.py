@@ -9,7 +9,7 @@ from ta.volatility import AverageTrueRange
 import plotly.graph_objects as go
 
 # SETTINGS
-SYMBOLS = ["AAPL", "TSLA", "MSFT", "NVDA"]
+SYMBOLS = ["AAPL", "TSLA", "MSFT", "NVDA", "GC=F"]
 INTERVAL = "5m"
 PERIOD = "5d"
 
