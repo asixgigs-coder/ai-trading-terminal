@@ -1,77 +1,79 @@
-import streamlit as st
+import time
+import requests
 import yfinance as yf
 import pandas as pd
-import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator
 from ta.volatility import AverageTrueRange
-import plotly.graph_objects as go
 
-# SETTINGS
-SYMBOLS = ["AAPL", "TSLA", "MSFT", "NVDA", "GC=F"]
-INTERVAL = "5m"
-PERIOD = "5d"
+# =========================
+# CONFIG
+# =========================
+SYMBOLS = ["AAPL","TSLA","MSFT","NVDA","AMZN","META","GC=F"]
 
-st.set_page_config(layout="wide")
-st.title("🚀 AI Trading Terminal (Stable Version)")
+TELEGRAM_TOKEN = "YOUR_BOT_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
 
-# STATE
-if "balance" not in st.session_state:
-    st.session_state.balance = 10000
-    st.session_state.positions = {}
-    st.session_state.trades = []
+COOLDOWN = 300  # seconds
 
-# SIDEBAR
-symbol = st.sidebar.selectbox("Select Stock", SYMBOLS)
-auto_trade = st.sidebar.toggle("Auto Trade", False)
+last_alert_time = {}
 
-# FETCH DATA (SAFE)
-@st.cache_data(ttl=60)
+# =========================
+# TELEGRAM ALERT
+# =========================
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
+    try:
+        requests.post(url, data=data)
+    except:
+        pass
+
+# =========================
+# FETCH DATA
+# =========================
 def fetch(symbol):
-    df = yf.download(symbol, period=PERIOD, interval=INTERVAL, auto_adjust=True)
+    df = yf.download(symbol, period="5d", interval="5m", auto_adjust=True)
 
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # FIX MultiIndex
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    required = ["Open", "High", "Low", "Close", "Volume"]
-    df = df[[col for col in required if col in df.columns]]
+    df = df[["Open","High","Low","Close","Volume"]]
+    return df.dropna()
 
-    df.dropna(inplace=True)
-    return df
-
-# FEATURES (SAFE)
+# =========================
+# FEATURES
+# =========================
 def features(df):
-    if df.empty or len(df) < 50:
-        return pd.DataFrame()
+    close = df["Close"]
+    high = df["High"]
+    low = df["Low"]
+    volume = df["Volume"]
 
-    close = pd.to_numeric(df["Close"], errors="coerce")
-    high = pd.to_numeric(df["High"], errors="coerce")
-    low = pd.to_numeric(df["Low"], errors="coerce")
+    df["ema20"] = close.ewm(span=20).mean()
+    df["ema50"] = close.ewm(span=50).mean()
+    df["rsi"] = RSIIndicator(close).rsi()
+    df["atr"] = AverageTrueRange(high, low, close).average_true_range()
 
-    df["ema20"] = EMAIndicator(close, window=20).ema_indicator()
-    df["ema50"] = EMAIndicator(close, window=50).ema_indicator()
-    df["rsi"] = RSIIndicator(close, window=14).rsi()
-    df["atr"] = AverageTrueRange(high, low, close, window=14).average_true_range()
+    df["trend_strength"] = abs(df["ema20"] - df["ema50"])
+    df["volume_spike"] = volume / volume.rolling(20).mean()
 
     df["returns"] = close.pct_change()
 
-    df.dropna(inplace=True)
-    return df
+    return df.dropna()
 
-# TARGET
-def target(df):
-    df["target"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
-    df.dropna(inplace=True)
-    return df
-
-# MODEL (STABLE)
+# =========================
+# MODEL
+# =========================
 def train(df):
-    feats = ["ema20","ema50","rsi","atr","returns"]
+    df["target"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
+    df = df.dropna()
+
+    feats = ["ema20","ema50","rsi","atr","trend_strength","volume_spike","returns"]
 
     if len(df) < 100:
         return None, feats
@@ -79,102 +81,101 @@ def train(df):
     X = df[feats]
     y = df["target"]
 
-    split = int(len(df) * 0.8)
-
     model = RandomForestClassifier(n_estimators=100)
-    model.fit(X[:split], y[:split])
+    model.fit(X, y)
 
     return model, feats
 
-# SIGNAL
-def signal(row, prob):
-    if prob > 0.6 and row["ema20"] > row["ema50"]:
+# =========================
+# HIGHER TIMEFRAME
+# =========================
+def higher_trend(symbol):
+    df = yf.download(symbol, period="1mo", interval="1h")
+
+    if df.empty:
+        return None
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    close = df["Close"]
+
+    ema20 = close.ewm(span=20).mean()
+    ema50 = close.ewm(span=50).mean()
+
+    return "UP" if ema20.iloc[-1] > ema50.iloc[-1] else "DOWN"
+
+# =========================
+# SIGNAL LOGIC
+# =========================
+def signal(row, prob, htf):
+    if row["trend_strength"] < 0.05:
+        return "HOLD"
+
+    if row["volume_spike"] < 1.2:
+        return "HOLD"
+
+    if prob > 0.65 and row["ema20"] > row["ema50"] and htf == "UP":
         return "BUY"
-    elif prob < 0.4 and row["ema20"] < row["ema50"]:
+
+    if prob < 0.35 and row["ema20"] < row["ema50"] and htf == "DOWN":
         return "SELL"
+
     return "HOLD"
 
-# TRADE (paper)
-def trade(sig, price, atr, symbol):
-    balance = st.session_state.balance
-    positions = st.session_state.positions
+# =========================
+# MAIN LOOP
+# =========================
+def run():
+    global last_alert_time
 
-    risk = balance * 0.02
+    while True:
+        print("🔎 Scanning market...")
 
-    if sig == "BUY" and symbol not in positions:
-        qty = risk / (1.5 * atr)
-        positions[symbol] = {"qty": qty, "entry": price}
-        st.session_state.trades.append(f"BUY {symbol} @ {price:.2f}")
+        for sym in SYMBOLS:
+            try:
+                df = fetch(sym)
+                if df.empty:
+                    continue
 
-    elif sig == "SELL" and symbol in positions:
-        entry = positions[symbol]["entry"]
-        qty = positions[symbol]["qty"]
-        profit = (price - entry) * qty
+                df = features(df)
+                if df.empty:
+                    continue
 
-        st.session_state.balance += profit
-        del positions[symbol]
+                model, feats = train(df)
+                if model is None:
+                    continue
 
-        st.session_state.trades.append(f"SELL {symbol} @ {price:.2f} | PnL {profit:.2f}")
+                latest = df.iloc[-1]
+                prob = model.predict_proba([latest[feats]])[0][1]
 
-# ===== RUN =====
+                htf = higher_trend(sym)
+                sig = signal(latest, prob, htf)
 
-df = fetch(symbol)
+                now = time.time()
 
-if df.empty:
-    st.error("No data loaded")
-    st.stop()
+                # 🚨 ALERT LOGIC
+                if sig != "HOLD":
+                    if sym not in last_alert_time or now - last_alert_time[sym] > COOLDOWN:
+                        msg = f"""
+📊 {sym}
+Signal: {sig}
+Price: {latest['Close']:.2f}
+Confidence: {prob:.2f}
+Trend: {htf}
+Volume Spike: {latest['volume_spike']:.2f}
+"""
+                        print(msg)
+                        send_telegram(msg)
+                        last_alert_time[sym] = now
 
-df = features(df)
+            except Exception as e:
+                print(f"Error {sym}: {e}")
 
-if df.empty:
-    st.warning("Not enough data yet...")
-    st.stop()
+        time.sleep(300)
 
-df = target(df)
-
-model, feats = train(df)
-
-if model is None:
-    st.warning("Model not ready yet...")
-    st.stop()
-
-latest = df.iloc[-1]
-
-prob = model.predict_proba([latest[feats]])[0][1]
-sig = signal(latest, prob)
-
-# UI
-col1, col2, col3, col4 = st.columns(4)
-
-col1.metric("Price", f"{latest['Close']:.2f}")
-col2.metric("AI Confidence", f"{prob:.2f}")
-col3.metric("Signal", sig)
-col4.metric("Balance", f"{st.session_state.balance:.2f}")
-
-# CHART
-fig = go.Figure()
-
-fig.add_trace(go.Candlestick(
-    x=df.index,
-    open=df["Open"],
-    high=df["High"],
-    low=df["Low"],
-    close=df["Close"]
-))
-
-fig.add_trace(go.Scatter(x=df.index, y=df["ema20"], name="EMA20"))
-fig.add_trace(go.Scatter(x=df.index, y=df["ema50"], name="EMA50"))
-
-st.plotly_chart(fig, use_container_width=True)
-
-# AUTO TRADE
-if auto_trade:
-    trade(sig, latest["Close"], latest["atr"], symbol)
-
-# POSITIONS
-st.subheader("📂 Open Positions")
-st.write(st.session_state.positions)
-
-# LOG
-st.subheader("📜 Trade Log")
-st.write(st.session_state.trades)
+# =========================
+# START
+# =========================
+if __name__ == "__main__":
+    run()
